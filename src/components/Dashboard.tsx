@@ -12,15 +12,27 @@ import {
   Pencil,
   Trash2,
   Loader2,
-  X
+  X,
+  Search,
+  Download
 } from 'lucide-react';
+import { 
+  ResponsiveContainer, 
+  BarChart, 
+  Bar, 
+  XAxis, 
+  YAxis, 
+  Tooltip as RechartsTooltip, 
+  Legend, 
+  CartesianGrid 
+} from 'recharts';
 import { Group, Expense, BudgetType, CATEGORIES } from '../types';
 import { db } from '../firebase';
-import { collection, query, onSnapshot, orderBy, limit, doc, updateDoc, deleteDoc, Timestamp } from 'firebase/firestore';
+import { collection, query, onSnapshot, orderBy, limit, doc, updateDoc, deleteDoc, Timestamp, addDoc } from 'firebase/firestore';
 import { User } from 'firebase/auth';
 import { formatCurrency } from '../utils/format';
 import { handleFirestoreError, OperationType } from '../utils/errorHandling';
-import { getLocalExpenses, updateLocalExpense, deleteLocalExpense } from '../utils/localDb';
+import { getLocalExpenses, updateLocalExpense, deleteLocalExpense, saveLocalExpense } from '../utils/localDb';
 
 interface DashboardProps {
   user: User;
@@ -44,6 +56,152 @@ export default function Dashboard({ user, groups, onSelectGroup, theme }: Dashbo
   const [recentExpenses, setRecentExpenses] = useState<DashboardExpense[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [isGroupsListOpen, setIsGroupsListOpen] = useState(false);
+
+  const [allGroupsExpenses, setAllGroupsExpenses] = useState<DashboardExpense[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+
+  // Quick Add states
+  const [quickAddOpen, setQuickAddOpen] = useState(false);
+  const [quickAmount, setQuickAmount] = useState('');
+  const [quickDescription, setQuickDescription] = useState('');
+  const [quickCategory, setQuickCategory] = useState(CATEGORIES[0]);
+  const [quickDate, setQuickDate] = useState(new Date().toISOString().split('T')[0]);
+  const [quickGroupId, setQuickGroupId] = useState('');
+
+  // Pre-select group when groups list updates
+  useEffect(() => {
+    if (groups.length > 0 && !quickGroupId) {
+      setQuickGroupId(groups[0].id);
+    }
+  }, [groups, quickGroupId]);
+
+  // Filtered groups based on search query
+  const filteredGroups = React.useMemo(() => {
+    const queryStr = searchQuery.toLowerCase().trim();
+    if (!queryStr) return [];
+    return groups.filter(
+      group => 
+        group.name.toLowerCase().includes(queryStr) || 
+        group.type.toLowerCase().includes(queryStr)
+    );
+  }, [groups, searchQuery]);
+
+  // CSV Export for personal records
+  const handleExportCSV = () => {
+    if (allGroupsExpenses.length === 0) return;
+
+    const headers = ['Group', 'Date', 'Description', 'Category', 'Amount', 'Paid By', 'Split Type'];
+    
+    const rows = allGroupsExpenses.map(expense => {
+      const group = groups.find(g => g.id === expense.groupId);
+      const groupName = group ? group.name : 'Unknown';
+      const dateStr = expense.date.toDate().toLocaleDateString();
+      const paidByStr = expense.paidBy === user.uid ? 'You' : expense.paidBy;
+      
+      const cleanGroupName = `"${groupName.replace(/"/g, '""')}"`;
+      const cleanDesc = `"${expense.description.replace(/"/g, '""')}"`;
+      const cleanCategory = `"${expense.category.replace(/"/g, '""')}"`;
+      
+      return [
+        cleanGroupName,
+        dateStr,
+        cleanDesc,
+        cleanCategory,
+        expense.amount.toFixed(2),
+        paidByStr,
+        expense.splitType
+      ];
+    });
+
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `budgeted_all_groups_export_${new Date().toISOString().split('T')[0]}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Recharts Monthly Summary Calculations for the last 6 months
+  const monthlyChartData = React.useMemo(() => {
+    const dataMap: { [key: string]: { monthName: string; total: number; [groupName: string]: any } } = {};
+    const months: { year: number; month: number; label: string; key: string }[] = [];
+
+    const now = new Date();
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const label = d.toLocaleString('en-US', { month: 'short' });
+      const year = d.getFullYear();
+      const month = d.getMonth();
+      const key = `${year}-${month}`;
+      months.push({ year, month, label, key });
+      dataMap[key] = { monthName: label, total: 0 };
+    }
+
+    groups.forEach(g => {
+      months.forEach(m => {
+        dataMap[m.key][g.name] = 0;
+      });
+    });
+
+    allGroupsExpenses.forEach(expense => {
+      const expDate = expense.date.toDate();
+      const year = expDate.getFullYear();
+      const month = expDate.getMonth();
+      const key = `${year}-${month}`;
+
+      if (dataMap[key]) {
+        const group = groups.find(g => g.id === expense.groupId);
+        const groupName = group ? group.name : 'Unknown';
+        
+        dataMap[key].total = (dataMap[key].total || 0) + expense.amount;
+        dataMap[key][groupName] = (dataMap[key][groupName] || 0) + expense.amount;
+      }
+    });
+
+    return months.map(m => dataMap[m.key]);
+  }, [allGroupsExpenses, groups]);
+
+  // Quick Add handler
+  const handleQuickAddExpense = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!quickAmount || !quickDescription || !quickGroupId) return;
+
+    setIsSaving(true);
+    try {
+      const expenseData = {
+        amount: parseFloat(quickAmount),
+        description: quickDescription.trim(),
+        category: quickCategory,
+        paidBy: user.uid,
+        date: Timestamp.fromDate(new Date(quickDate)),
+        splitType: 'equal' as const,
+      };
+
+      if (user.uid === 'local_guest') {
+        saveLocalExpense(quickGroupId, expenseData);
+      } else {
+        const { serverTimestamp } = await import('firebase/firestore');
+        await addDoc(collection(db, 'groups', quickGroupId, 'expenses'), {
+          ...expenseData,
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      setQuickAmount('');
+      setQuickDescription('');
+      setQuickCategory(CATEGORIES[0]);
+      setQuickDate(new Date().toISOString().split('T')[0]);
+      setQuickAddOpen(false);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, `groups/${quickGroupId}/expenses`);
+    } finally {
+      setIsSaving(false);
+    }
+  };
   
   // Edit/Delete states
   const [editingExpense, setEditingExpense] = useState<DashboardExpense | null>(null);
@@ -203,6 +361,7 @@ export default function Dashboard({ user, groups, onSelectGroup, theme }: Dashbo
 
         allExpenses.sort((a, b) => b.date.toMillis() - a.date.toMillis());
         setRecentExpenses(allExpenses.slice(0, 10));
+        setAllGroupsExpenses(allExpenses);
         setAlerts(newAlerts);
       };
 
@@ -236,6 +395,7 @@ export default function Dashboard({ user, groups, onSelectGroup, theme }: Dashbo
         
         // Take top 10
         setRecentExpenses(allExpenses.slice(0, 10));
+        setAllGroupsExpenses(allExpenses);
         
         // Generate alerts based on budgets
         const newAlerts: Alert[] = [];
@@ -285,16 +445,91 @@ export default function Dashboard({ user, groups, onSelectGroup, theme }: Dashbo
           </h1>
           <p className="text-zinc-500 dark:text-zinc-400 font-medium text-lg">Here's what's happening with your shared budgets today.</p>
         </div>
-        <button 
-          onClick={() => (window as any).openCreateGroupModal?.()}
-          className="flex items-center gap-2 px-6 py-3 bg-indigo-600 text-white rounded-2xl text-sm font-bold hover:bg-indigo-700 hover:shadow-xl hover:shadow-indigo-500/40 transition-all shadow-lg shadow-indigo-500/20 active:scale-95"
-        >
-          <Plus className="w-4 h-4" />
-          Create New Group
-        </button>
+        <div className="flex flex-wrap items-center gap-3">
+          <button 
+            onClick={handleExportCSV}
+            disabled={allGroupsExpenses.length === 0}
+            className="flex items-center gap-2 px-6 py-3 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 rounded-2xl text-sm font-bold hover:bg-zinc-50 dark:hover:bg-zinc-800/50 hover:shadow-md transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer shadow-sm"
+          >
+            <Download className="w-4 h-4" />
+            Export CSV
+          </button>
+          <button 
+            onClick={() => (window as any).openCreateGroupModal?.()}
+            className="flex items-center gap-2 px-6 py-3 bg-indigo-600 text-white rounded-2xl text-sm font-bold hover:bg-indigo-700 hover:shadow-xl hover:shadow-indigo-500/40 transition-all shadow-lg shadow-indigo-500/20 active:scale-95 cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            Create New Group
+          </button>
+        </div>
       </header>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12">
+      {/* Search Bar */}
+      <div className="relative mb-10 max-w-xl">
+        <Search className="w-5 h-5 absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400 dark:text-zinc-500" />
+        <input
+          type="text"
+          placeholder="Search groups by name or type (e.g. personal, household, trip)..."
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          className="w-full pl-12 pr-10 py-3.5 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all text-sm dark:text-white font-medium shadow-sm outline-none"
+        />
+        {searchQuery && (
+          <button 
+            onClick={() => setSearchQuery('')}
+            className="absolute right-4 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 dark:hover:text-white cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        )}
+      </div>
+
+      {searchQuery.trim() !== '' ? (
+        <section className="mb-12">
+          <h2 className="text-xl font-bold tracking-tight text-zinc-900 dark:text-white font-display mb-6">
+            Search Results ({filteredGroups.length})
+          </h2>
+          {filteredGroups.length === 0 ? (
+            <div className="p-12 bg-white dark:bg-zinc-900 rounded-[32px] border border-zinc-200 dark:border-zinc-800 text-center text-zinc-500 dark:text-zinc-400 font-medium">
+              No groups match "{searchQuery}"
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {filteredGroups.map(group => (
+                <button
+                  key={group.id}
+                  onClick={() => onSelectGroup(group.id)}
+                  className="text-left bg-white dark:bg-zinc-900 p-6 rounded-[28px] border border-zinc-200 dark:border-zinc-800 hover:border-indigo-500 dark:hover:border-indigo-500/50 hover:shadow-lg hover:shadow-indigo-500/5 transition-all group flex flex-col justify-between h-44 cursor-pointer relative overflow-hidden"
+                >
+                  <div className="absolute top-0 right-0 w-24 h-24 bg-zinc-50 dark:bg-zinc-800/20 rounded-full -mr-12 -mt-12 group-hover:scale-110 transition-transform animate-pulse" />
+                  <div className="relative z-10 w-full">
+                    <div className="flex items-center justify-between mb-4">
+                      <span className={`text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-lg border ${
+                        group.type === 'personal' ? 'bg-blue-50 text-blue-600 border-blue-100 dark:bg-blue-500/10 dark:text-blue-400 dark:border-blue-500/20' :
+                        group.type === 'household' ? 'bg-emerald-50 text-emerald-600 border-emerald-100 dark:bg-emerald-500/10 dark:text-emerald-400 dark:border-emerald-500/20' :
+                        group.type === 'trip' ? 'bg-orange-50 text-orange-600 border-orange-100 dark:bg-orange-500/10 dark:text-orange-400 dark:border-orange-500/20' :
+                        'bg-zinc-50 text-zinc-600 border-zinc-100 dark:bg-zinc-500/10 dark:text-zinc-400 dark:border-zinc-500/20'
+                      }`}>
+                        {group.type}
+                      </span>
+                      <ArrowRight className="w-4 h-4 text-zinc-400 group-hover:translate-x-1.5 transition-transform" />
+                    </div>
+                    <h3 className="text-lg font-bold text-zinc-900 dark:text-white group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors line-clamp-1 mb-1 font-display">{group.name}</h3>
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400 line-clamp-2 leading-relaxed">{group.description || 'No description provided.'}</p>
+                  </div>
+                  {group.maxBudget && (
+                    <div className="text-[10px] font-bold text-zinc-400 dark:text-zinc-500 mt-4 font-display">
+                      Budget: ${group.maxBudget} ({group.budgetType})
+                    </div>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+      ) : (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12">
         <button 
           onClick={() => {
             if (groups.length === 0) return;
@@ -400,6 +635,110 @@ export default function Dashboard({ user, groups, onSelectGroup, theme }: Dashbo
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-12">
         <div className="lg:col-span-2 space-y-12">
+          {/* Monthly Summary Card */}
+          <section className="bg-white dark:bg-zinc-900 p-8 rounded-[40px] border border-zinc-200 dark:border-zinc-800 shadow-xl shadow-zinc-200/50 dark:shadow-black/20">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
+              <div>
+                <h2 className="text-xl font-bold tracking-tight text-zinc-900 dark:text-white font-display flex items-center gap-2">
+                  <TrendingUp className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
+                  Monthly Summary
+                </h2>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400 font-medium mt-1">Spending trends over the last 6 months across your active groups</p>
+              </div>
+              <div className="text-right shrink-0">
+                <span className="text-2xl font-bold font-mono tracking-tight text-indigo-600 dark:text-indigo-400">
+                  ${formatCurrency(allGroupsExpenses.reduce((sum, e) => {
+                    const expDate = e.date.toDate();
+                    const now = new Date();
+                    const sixMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 5, 1);
+                    return expDate >= sixMonthsAgo ? sum + e.amount : sum;
+                  }, 0))}
+                </span>
+                <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-500 uppercase tracking-wider">6-Month Total</p>
+              </div>
+            </div>
+
+            {allGroupsExpenses.length === 0 ? (
+              <div className="h-[280px] flex flex-col items-center justify-center text-center p-6 bg-zinc-50 dark:bg-zinc-800/10 border border-dashed border-zinc-200 dark:border-zinc-800 rounded-[24px]">
+                <Calendar className="w-10 h-10 text-zinc-300 dark:text-zinc-700 mb-3" />
+                <p className="text-sm text-zinc-500 dark:text-zinc-400 font-medium">No spending data available to visualize yet.</p>
+                <p className="text-xs text-zinc-400 dark:text-zinc-600 mt-1">Log some expenses to populate the monthly summary chart.</p>
+              </div>
+            ) : (
+              <div className="h-[280px] w-full pr-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={monthlyChartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={theme === 'dark' ? '#27272a' : '#f4f4f5'} />
+                    <XAxis 
+                      dataKey="monthName" 
+                      axisLine={false} 
+                      tickLine={false} 
+                      tick={{ fontSize: 10, fill: '#a1a1aa', fontWeight: 500 }}
+                    />
+                    <YAxis 
+                      axisLine={false} 
+                      tickLine={false} 
+                      tick={{ fontSize: 10, fill: '#a1a1aa', fontWeight: 500 }}
+                      tickFormatter={(value) => `$${value}`}
+                    />
+                    <RechartsTooltip 
+                      cursor={{ fill: theme === 'dark' ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.02)', radius: 12 }}
+                      content={({ active, payload, label }) => {
+                        if (active && payload && payload.length) {
+                          const total = payload.reduce((sum: number, entry: any) => sum + (entry.value || 0), 0);
+                          if (total === 0) return null;
+                          return (
+                            <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 p-4 rounded-2xl shadow-xl backdrop-blur-md z-50">
+                              <p className="font-bold text-zinc-900 dark:text-white mb-2 text-xs">{label}</p>
+                              <div className="space-y-1.5 max-h-[160px] overflow-y-auto custom-scrollbar">
+                                {payload.map((entry: any, index: number) => {
+                                  if (!entry.value) return null;
+                                  return (
+                                    <p key={index} className="text-[10px] font-medium flex items-center gap-2">
+                                      <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: entry.color }} />
+                                      <span className="text-zinc-500 dark:text-zinc-400 truncate max-w-[120px]">{entry.name}:</span>
+                                      <span className="font-mono font-bold text-zinc-900 dark:text-white">${entry.value.toFixed(2)}</span>
+                                    </p>
+                                  );
+                                })}
+                              </div>
+                              <div className="border-t border-zinc-100 dark:border-zinc-800 mt-2 pt-2 flex items-center justify-between">
+                                <span className="text-[10px] font-bold text-zinc-700 dark:text-zinc-300">Total:</span>
+                                <span className="font-mono font-bold text-xs text-indigo-600 dark:text-indigo-400">
+                                  ${total.toFixed(2)}
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        }
+                        return null;
+                      }}
+                    />
+                    <Legend 
+                      verticalAlign="top" 
+                      height={36} 
+                      iconType="circle"
+                      iconSize={8}
+                      wrapperStyle={{ fontSize: 10, fontWeight: 500, paddingBottom: 10 }}
+                    />
+                    {groups.map((group, index) => {
+                      const CHART_COLORS = ['#6366f1', '#10b981', '#f59e0b', '#3b82f6', '#ec4899', '#8b5cf6', '#14b8a6', '#f43f5e'];
+                      return (
+                        <Bar 
+                          key={group.id} 
+                          dataKey={group.name} 
+                          stackId="a" 
+                          fill={CHART_COLORS[index % CHART_COLORS.length]} 
+                          radius={index === groups.length - 1 ? [4, 4, 0, 0] : [0, 0, 0, 0]} 
+                        />
+                      );
+                    })}
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </section>
+
           <section>
             <div className="flex items-center justify-between mb-6">
               <h2 className="text-xl font-bold tracking-tight text-zinc-900 dark:text-white font-display">Recent Activity</h2>
@@ -512,6 +851,8 @@ export default function Dashboard({ user, groups, onSelectGroup, theme }: Dashbo
           </section>
         </div>
       </div>
+        </>
+      )}
 
       {/* Modals */}
       <AnimatePresence>
@@ -654,7 +995,139 @@ export default function Dashboard({ user, groups, onSelectGroup, theme }: Dashbo
             </motion.div>
           </div>
         )}
+
+        {quickAddOpen && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }} 
+              animate={{ opacity: 1 }} 
+              exit={{ opacity: 0 }}
+              onClick={() => setQuickAddOpen(false)}
+              className="absolute inset-0 bg-zinc-950/60 backdrop-blur-sm"
+            />
+            <motion.div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="quick-add-expense-title"
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-md bg-white dark:bg-zinc-900 rounded-[40px] shadow-2xl p-10 outline-none z-10"
+              tabIndex={-1}
+            >
+              <div className="flex items-center justify-between mb-8">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-indigo-50 dark:bg-indigo-500/10 rounded-xl flex items-center justify-center text-indigo-600 dark:text-indigo-400">
+                    <Plus className="w-5 h-5" />
+                  </div>
+                  <h3 id="quick-add-expense-title" className="text-xl font-bold tracking-tight text-zinc-900 dark:text-white font-display">Quick Add Expense</h3>
+                </div>
+                <button 
+                  onClick={() => setQuickAddOpen(false)} 
+                  className="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full transition-colors outline-none focus:ring-2 focus:ring-indigo-500"
+                  aria-label="Close modal"
+                >
+                  <X className="w-5 h-5 text-zinc-500" />
+                </button>
+              </div>
+              
+              <form onSubmit={handleQuickAddExpense} className="space-y-6">
+                <div>
+                  <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-[0.15em] mb-2">Select Group</label>
+                  <select
+                    value={quickGroupId}
+                    onChange={(e) => setQuickGroupId(e.target.value)}
+                    className="w-full px-5 py-4 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all font-medium appearance-none dark:text-white"
+                    required
+                  >
+                    {groups.map(g => (
+                      <option key={g.id} value={g.id}>{g.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-[0.15em] mb-2">Amount</label>
+                  <div className="relative">
+                    <span className="absolute left-5 top-1/2 -translate-y-1/2 text-zinc-400 font-mono font-bold">$</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={quickAmount}
+                      onChange={(e) => setQuickAmount(e.target.value)}
+                      className="w-full pl-10 pr-5 py-4 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all font-mono font-bold dark:text-white"
+                      placeholder="0.00"
+                      required
+                      autoFocus
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-[0.15em] mb-2">Description</label>
+                  <input
+                    type="text"
+                    value={quickDescription}
+                    onChange={(e) => setQuickDescription(e.target.value)}
+                    className="w-full px-5 py-4 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all font-medium dark:text-white"
+                    placeholder="What was this for?"
+                    required
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-[0.15em] mb-2">Category</label>
+                    <select
+                      value={quickCategory}
+                      onChange={(e) => setQuickCategory(e.target.value)}
+                      className="w-full px-5 py-4 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all font-medium appearance-none dark:text-white"
+                    >
+                      {CATEGORIES.map(cat => (
+                        <option key={cat} value={cat}>{cat}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-[0.15em] mb-2">Date</label>
+                    <input
+                      type="date"
+                      value={quickDate}
+                      onChange={(e) => setQuickDate(e.target.value)}
+                      className="w-full px-5 py-4 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all font-medium dark:text-white"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isSaving}
+                  className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-bold hover:bg-indigo-700 transition-all mt-4 flex items-center justify-center gap-2 disabled:opacity-50 shadow-lg shadow-indigo-500/20 active:scale-95 cursor-pointer"
+                >
+                  {isSaving ? <Loader2 className="w-5 h-5 animate-spin" /> : 'Log Expense'}
+                </button>
+              </form>
+            </motion.div>
+          </div>
+        )}
       </AnimatePresence>
+
+      {/* Quick Add FAB */}
+      {groups.length > 0 && (
+        <div className="fixed bottom-8 right-8 z-[50]">
+          <button
+            onClick={() => setQuickAddOpen(true)}
+            className="flex items-center justify-center w-14 h-14 bg-gradient-to-br from-indigo-600 to-violet-600 text-white rounded-full shadow-2xl shadow-indigo-500/40 hover:scale-110 active:scale-95 transition-all group relative outline-none focus:ring-4 focus:ring-indigo-500/40 cursor-pointer"
+            title="Quick Add Expense"
+          >
+            <Plus className="w-7 h-7 transition-transform group-hover:rotate-90 duration-300" />
+            <span className="absolute right-16 bg-zinc-950 text-white text-xs font-bold py-1.5 px-3 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap shadow-xl border border-zinc-800">
+              Quick Add Expense
+            </span>
+          </button>
+        </div>
+      )}
     </div>
   );
 }

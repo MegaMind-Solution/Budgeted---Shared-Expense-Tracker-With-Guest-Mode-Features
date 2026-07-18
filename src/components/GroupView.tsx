@@ -17,7 +17,8 @@ import {
   Sparkles,
   Loader2,
   Pencil,
-  X
+  X,
+  Download
 } from 'lucide-react';
 import { 
   LineChart, 
@@ -94,6 +95,42 @@ export default function GroupView({ groupId, user, onBack, theme }: GroupViewPro
   // Delete confirmation state
   const [expenseToDelete, setExpenseToDelete] = useState<string | null>(null);
   const [isDeleteGroupConfirmOpen, setIsDeleteGroupConfirmOpen] = useState(false);
+
+  // CSV Export for current group data
+  const handleExportCSV = () => {
+    if (!group || expenses.length === 0) return;
+
+    const headers = ['Date', 'Description', 'Category', 'Amount', 'Paid By', 'Split Type'];
+    
+    const rows = expenses.map(expense => {
+      const dateStr = expense.date.toDate().toLocaleDateString();
+      const paidByMember = members.find(m => m.uid === expense.paidBy);
+      const paidByName = paidByMember ? (paidByMember.displayName || paidByMember.email || expense.paidBy) : (expense.paidBy === user.uid ? 'You' : expense.paidBy);
+      
+      const cleanDesc = `"${expense.description.replace(/"/g, '""')}"`;
+      const cleanCategory = `"${expense.category.replace(/"/g, '""')}"`;
+      
+      return [
+        dateStr,
+        cleanDesc,
+        cleanCategory,
+        expense.amount.toFixed(2),
+        `"${paidByName.replace(/"/g, '""')}"`,
+        expense.splitType
+      ];
+    });
+
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `${group.name.toLowerCase().replace(/[^a-z0-9]+/g, '_')}_expenses_${new Date().toISOString().split('T')[0]}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
   useEffect(() => {
     if (selectedStatDetails && statModalRef.current) {
@@ -477,10 +514,19 @@ export default function GroupView({ groupId, user, onBack, theme }: GroupViewPro
           )}
           <button 
             onClick={() => setIsAddMemberOpen(true)}
-            className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 sm:px-5 py-3 border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 rounded-2xl text-sm font-bold text-zinc-700 dark:text-zinc-300 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 hover:border-indigo-200 dark:hover:border-indigo-800 hover:shadow-lg hover:shadow-indigo-500/10 transition-all active:scale-95"
+            className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 sm:px-5 py-3 border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 rounded-2xl text-sm font-bold text-zinc-700 dark:text-zinc-300 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 hover:border-indigo-200 dark:hover:border-indigo-800 hover:shadow-lg hover:shadow-indigo-500/10 transition-all active:scale-95 cursor-pointer"
           >
             <UserPlus className="w-4 h-4" />
             Invite
+          </button>
+          <button 
+            onClick={handleExportCSV}
+            disabled={expenses.length === 0}
+            className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 sm:px-5 py-3 border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 rounded-2xl text-sm font-bold text-zinc-700 dark:text-zinc-300 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 hover:border-indigo-200 dark:hover:border-indigo-800 hover:shadow-lg hover:shadow-indigo-500/10 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+            title="Export group expenses as a CSV file"
+          >
+            <Download className="w-4 h-4" />
+            Export CSV
           </button>
           <button 
             onClick={() => {
